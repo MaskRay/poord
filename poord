@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+from datetime import datetime
+import configparser, io, json, os, re, shlex, signal, socket, time, traceback
+
+socket_path = '/tmp/poord.{}'.format(os.getuid())
+name2service_unit = {}
+name2service = {}
+pid2service = {}
+name2timer_unit = {}
+name2timer = {}
+name2target = {}
+
+
+class Service(object):
+    name = None
+    active = False
+    pid = 0
+    description = None
+    exec_start = None
+    exec_stop = None
+    type = None
+    working_directory = None
+    since = None
+
+    def restart(self):
+        self.stop()
+        self.start()
+
+    def start(self, instance=None):
+        if self.active: return
+        print('start', self.name)
+        if instance:
+            if self.exec_start:
+                self.exec_start = [re.sub('%[Ii]', instance, i) for i in self.exec_start]
+            if self.exec_stop:
+                self.exec_stop = [re.sub('%[Ii]', instance, i) for i in self.exec_stop]
+        pipe = os.pipe()
+        pid = os.fork()
+        if pid < 0:
+            sys.exit(1)
+        if pid > 0:
+            self.active = True
+            self.pid = pid
+            self.since = time.time()
+            if self.type != 'forking':
+                pid2service[pid] = self
+            os.write(pipe[1], b'c')
+            os.close(pipe[0])
+            os.close(pipe[1])
+        else:
+            os.read(pipe[0], 1)
+            os.close(pipe[0])
+            os.close(pipe[1])
+            os.execv(self.exec_start[0], self.exec_start)
+            sys.exit(1)
+
+    def stop(self):
+        if self.type == 'forking':
+            print('stop', self.name)
+            os.spawnv(os.P_NOWAIT, self.exec_stop[0], self.exec_stop)
+        else:
+            if not self.active: return
+            self.active = False
+            print('stop', self.name)
+            os.kill(self.pid, signal.SIGTERM)
+
+
+def sigchld(signo, _):
+    while 1:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0: break
+            if pid in pid2service:
+                pid2service[pid].active = False
+        except ChildProcessError:
+            break
+
+
+def expand(line):
+    if not line: return None
+    line = re.sub('%h', os.path.expanduser('~'), line)
+    line = re.sub('%t', '/var/run', line)
+    return line
+
+
+def expand_multi(line):
+    if not line: return None
+    return [expand(i) for i in shlex.split(line)]
+
+
+def parse_service(name, filename):
+    config = configparser.ConfigParser()
+    config.read(filename)
+    service = Service()
+    service.name = name
+    try:
+        section = config['Unit']
+        service.description = section.get('Description', raw=True) or ''
+    except KeyError:
+        pass
+    section = config['Service']
+    service.exec_start = expand_multi(section.get('ExecStart', raw=True))
+    service.exec_stop = expand_multi(section.get('ExecStop', raw=True))
+    service.type = expand(section.get('Type', raw=True))
+    service.remain_after_exit = expand(section.get('RemainAfterExit', raw=True))
+    service.working_directory = expand(section.get('WorkingDirectory', raw=True))
+    return service
+
+
+def parse_timer(filename):
+    pass
+
+
+def load_target(target):
+    target_dir = '{}.target.wants'.format(target)
+    if not os.path.isdir(target_dir): return
+    for filename in os.listdir(target_dir):
+        if filename.endswith('.service'):
+            service = filename[:-8]
+            tmp = service.split('@')
+            unit = tmp[0]
+            instance = tmp[1] if len(tmp) > 1 else None
+            try:
+                if service not in name2service:
+                    name2service[service] = name2service_unit[unit]
+                name2service[service].start(instance)
+            except:
+                traceback.print_exc()
+
+
+def do_restart(name):
+    name2service[name].restart()
+
+
+def do_start(name):
+    name2service[name].start()
+
+
+def do_status(addr, name):
+    service = name2service[name]
+    buf = io.StringIO()
+    buf.write('{} - {}\n'.format(name, service.description))
+    buf.write('Active: ')
+    if service.active:
+        buf.write('\033[1;32mactive\033[m since {}'.format(datetime.fromtimestamp(service.since).isoformat()))
+    else:
+        buf.write('\033[1;31minactive\033[m')
+    buf.write('\n')
+    buf.write('Pid: {}\n'.format(service.pid))
+    server.sendto(buf.getvalue().encode(), 0, addr)
+
+
+def do_status_all(addr):
+    buf = io.StringIO()
+    for name, service in name2service.items():
+        buf.write('├─{}\n'.format(name))
+        if service.active:
+            buf.write('│ └─{} {}\n'.format(service.pid, service.exec_start))
+    server.sendto(buf.getvalue().encode(), 0, addr)
+
+
+def do_stop(name):
+    name2service[name].stop()
+
+
+signal.signal(signal.SIGCHLD, sigchld)
+
+os.chdir(os.path.expanduser('~/.config/systemd/user'))
+#os.chdir(os.path.expanduser('/tmp/user'))
+for filename in os.listdir('.'):
+    if filename.endswith('.service'):
+        name = filename[:-8]
+        if name[-1] == '@':
+            name = name[:-1]
+        name2service_unit[name] = parse_service(name, filename)
+    elif filename.endswith('.timer'):
+        name = filename[:-6]
+        if name[-1] == '@':
+            name = name[:-1]
+        name2timer_unit[name] = parse_timer(filename)
+load_target('default')
+load_target('graphical')
+
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+# DEBUG
+try:
+    os.unlink(socket_path)
+except FileNotFoundError:
+    pass
+server.bind(socket_path)
+while 1:
+    try:
+        data, addr = server.recvfrom(4096, 0)
+        dgram = json.loads(data.decode())
+        if dgram[0] == 'restart':
+            do_restart(dgram[1])
+        elif dgram[0] == 'start':
+            do_start(dgram[1])
+        elif dgram[0] == 'status':
+            if len(dgram) == 1:
+                do_status_all(addr)
+            else:
+                do_status(addr, dgram[1])
+        elif dgram[0] == 'stop':
+            do_stop(dgram[1])
+    except InterruptedError:
+        pass
+    except KeyboardInterrupt:
+        break
+    except:
+        traceback.print_exc()

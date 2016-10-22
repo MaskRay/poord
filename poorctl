@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+import argparse, json, os, socket, sys, tempfile
+socket_path = '/tmp/poord.{}'.format(os.getuid())
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+local_path = tempfile.mktemp(prefix='syctl.')
+sock.bind(local_path)
+sock.connect(socket_path)
+
+def send(args):
+    sock.send(json.dumps(args).encode())
+
+ap = argparse.ArgumentParser()
+subparsers = ap.add_subparsers(title='commands')
+
+sub = subparsers.add_parser('restart')
+sub.set_defaults(command='restart')
+sub.add_argument('name')
+
+sub = subparsers.add_parser('start')
+sub.set_defaults(command='start')
+sub.add_argument('name')
+
+sub = subparsers.add_parser('status')
+sub.set_defaults(command='status')
+sub.add_argument('name', nargs='?')
+
+sub = subparsers.add_parser('stop')
+sub.set_defaults(command='stop')
+sub.add_argument('name')
+
+options = ap.parse_args()
+command = options.command
+
+if command == 'restart':
+    send(['restart', options.name])
+elif command == 'start':
+    send(['start', options.name])
+elif command == 'status':
+    if options.name:
+        send(['status', options.name])
+    else:
+        send(['status'])
+    os.write(1, sock.recv(4096))
+elif command == 'stop':
+    send(['stop', options.name])
+os.unlink(local_path)
